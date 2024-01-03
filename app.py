@@ -1,17 +1,70 @@
-import pandas as pd
-import json
-from datetime import datetime
 import streamlit as st
+from annotated_text import annotated_text
+import pandas as pd
+import numpy as np
+import plotly.express as px
 import boto3
+import gspread
+import json
+import tempfile
+from oauth2client.service_account import ServiceAccountCredentials
 
-# # internal functions
-# import api_data_functions as adf
-# import property_functions as pf
-# import s3_functions as sf
-# import common_functions as cf
 
-st.set_page_config(layout="wide")
+##################################
+#           FUNCTIONS            #
+##################################
+def read_gshseets_dataset(file_name):
+    sheet = client.open(file_name).sheet1   
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
+    df['zpid'] = df.apply(lambda x: str(x['zpid']).split('.')[0], axis=1)
+    df['num_users_label'] = df.apply(lambda x: get_total_user_labels(x), axis=1)
+    df['label_category'] = df.apply(lambda x: get_label_category(x), axis=1)
+    df['final_label'] = df.apply(lambda x: get_final_label(x), axis=1)
+    return df, sheet
 
+
+def get_total_user_labels(x):
+    i = 0
+    for c in ['ariel', 'liam', 'maddy']:
+        if x[c] != None:
+            if x[c] != '':
+                i += 1
+    return i
+
+def get_label_category(x):
+    labels = []
+    for c in ['ariel', 'liam', 'maddy']:
+        if x[c] != None:
+            if x[c] != '':
+                labels.append(x[c])
+    if len(labels) == 0:
+        return 'not labeled'
+    if len(labels) == 1:
+        return 'single label'
+    if len(labels) == 2:
+        if len(list(set(labels))) == 1:
+            return 'confirmed label'
+        else:
+            return 'discrepancy'
+    if len(labels) == 3:
+        if len(list(set(labels))) == 2:
+            return 'confirmed label'
+        elif len(list(set(labels))) == 3:
+            return 'discrepancy'
+        
+def get_final_label(x):
+    labels = []
+    for c in ['ariel', 'liam', 'maddy']:
+        if x[c] != None:
+            if x[c] != '':
+                labels.append(x[c])
+
+    if x['label_category'] == 'confirmed label':
+        return max(labels,key=labels.count)
+    else:
+        return None
+    
 def read_json_file(bucket, key):
     """
     Reads json file from s3
@@ -27,7 +80,7 @@ def read_json_file(bucket, key):
     # Initialize boto3 to use the S3 client.
     s3_client = boto3.client('s3', 
         aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
-        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"])
+          aws_secret_access_key=st.secrets["AWS_SECRET_KEY"])
 
     # Get the file inside the S3 Bucket
     s3_response = s3_client.get_object(
@@ -44,179 +97,257 @@ def read_json_file(bucket, key):
     return json.loads(content)
 
 
-def read_df_from_s3(bucket, key):
-    
-    return pd.read_csv(
-        f's3://{bucket}/{key}',
-        storage_options={
-            "key":st.secrets["AWS_ACCESS_KEY"],
-            "secret":st.secrets["AWS_SECRET_KEY"]
-        }
+##################################
+#             SET UP             #
+##################################
+st.set_page_config(layout="wide")
+st.title("ML Labeling Tool: Property Condition")
+st.markdown("###### Label property description to determine condition")
+
+# read gdrive credentials
+config = read_json_file(bucket='residentialpropertydata', key='api/gdrive_creds.json')
+tfile = tempfile.NamedTemporaryFile(mode="w+")
+json.dump(config, tfile)
+tfile.flush()
+
+# define the scope
+scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+
+# add credentials to the account
+creds = ServiceAccountCredentials.from_json_keyfile_name(tfile.name, scope)
+
+# authorize the clientsheet 
+client = gspread.authorize(creds)
+
+labeled_data_fn = "ml_training_prop_cond_dscr_20231228"
+
+
+##################################
+#              APP               #
+##################################
+tab1, tab2, tab3 = st.tabs(["Login", "Label", "Analytics"])
+
+
+##################################
+#             TAB 1              #
+##################################
+user_name_selection = tab1.radio(
+    "Select User Name",
+    [":gray[Non selected]", ":red[Ariel]", ":blue[Liam]", ":green[Maddy]"],
+    # captions = ["", "Tampa Mamacita 💃", "Witty Brit 🇬🇧💂", "Cali Queen ☀️"]
     )
 
-def get_latest_listings_dt(prefix='api/rapid_api/zillow/property_listings'):
+session_button = tab1.button("Start session", type="primary")
+valid_session = False
+if "user_name" not in st.session_state:
+    st.session_state['user_name'] = ''
+if session_button:
+    # log labels
+    st.session_state['user_labeled_zpid'] = {'Ariel': [], 'Liam': [], 'Maddy': []}
+    for x in ['Non selected', 'Ariel', 'Liam', 'Maddy']:
+        if x in user_name_selection:
+            valid_session = True
+            st.session_state['user_name'] = x
+            if st.session_state['user_name'] in ['Ariel', 'Liam', 'Maddy']:
+                with st.spinner('Session starting loading dataset...'):
+                    # load dataset
+                    st.session_state['dataset_initial'], st.session_state['sheet_name'] = read_gshseets_dataset(file_name=labeled_data_fn)
+                    st.session_state['dataset_labeled'] = st.session_state['dataset_initial']
+                tab1.write('Session started')
 
-    s3 = boto3.resource('s3', 
-                        aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
-                        aws_secret_access_key=st.secrets["AWS_SECRET_KEY"]
-                        )
-    objects = list(s3.Bucket('residentialpropertydata').objects.filter(Prefix=prefix))
-    objects.sort(key=lambda o: o.last_modified)
-    return objects[-1].key.split('/')[-1].split('_')[0] # return date in str format
 
-def latest_sale_listing_dt(x):
-    """
-    Price changes
+# sheet.update_cell(2,12,'updated')
+# st.write(data[0])
 
-    Args:
-        price_history_dict [dict]: price history changes
 
-    Returns:
-        latest sale listing date
-    """
-    if x['datePosted'] != None:
-        return x['datePosted']
+##################################
+#             TAB 2              #
+##################################
+user_name = st.session_state['user_name']
+if (st.session_state['user_name'] in ['Ariel', 'Liam', 'Maddy']):
+    tab2.write(f'Logged in as: {user_name}')
+
+    # prepare dataset
+    df = st.session_state['dataset_labeled']
+    
+    # df = df.loc[(~df['zpid'] == '') & (~df['description'].isnull())]
+    df.loc[(df[user_name.lower()] == '') & (df['label_category'] == 'discrepancy'), 'label_priority'] = 4
+    df.loc[(df[user_name.lower()] == '') & (df['label_category'] == 'single label'), 'label_priority'] = 3
+    df.loc[(df['label_category'] == 'not labeled') & (df['fixer_upper_flag'] == 'TRUE'), 'label_priority'] = 2
+    df.loc[(df['label_category'] == 'not labeled') & (df['fixer_upper_flag'] == 'FALSE'), 'label_priority'] = 1
+    df.loc[(df['label_category'] == 'not labeled') & (df['proba_distressed'] <= 0.60) & (df['proba_distressed'] >= 0.40), 'low_confidence_v1_model'] = 1
+    
+    user_labeled_zpids_in_session = st.session_state['user_labeled_zpid'][user_name]
+    if str(len(user_labeled_zpids_in_session)).split('.')[0][-1] in ['11']: # not using right now
+        df = df.sort_values(by=['low_confidence_v1_model', 'proba_distressed', 'price_prct_diff'], ascending=True)
+    elif str(len(user_labeled_zpids_in_session)).split('.')[0][-1] in ['7', '8', '9']:
+        df = df\
+            .sort_values(by=['price_prct_diff'], ascending=False)\
+            .sort_values(by=['label_priority', 'proba_distressed'], ascending=True)
     else:
-        try:
-            price_history_dict = x['priceHistory']
-            latest_listed_dt = [x for x in price_history_dict if (x['event'] in ['Listed for sale'])][0]['date']
-            if len(latest_listed_dt) > 0:
-                return latest_listed_dt
-            else:
-                return x['datePosted']
-        except:
-            return x['datePosted'] # invalid date
+        df = df\
+            .sort_values(by=['price_prct_diff'], ascending=False)\
+            .sort_values(by=['label_priority', 'proba_distressed'], ascending=False)
+    
+    # if len(user_labeled_zpids_in_session) != 0:
+    df = df.loc[~df['zpid'].isin(user_labeled_zpids_in_session)]
+
+    # tab2.write(df.head())
+    # tab2.write(user_labeled_zpids_in_session)
+
+    # display
+    col1, col2 = tab2.columns(2)
+
+    col1.markdown("### Inferences")
+    zpid = df.iloc[0]['zpid']
+    model_clf = df.iloc[0]['fixer_upper_flag']
+    model_proba = df.iloc[0]['proba_distressed']
+    prop_dscr_raw = df.iloc[0]['description']
+    street_address = df.iloc[0]['streetAddress']
+    city = df.iloc[0]['city']
+    # if model_clf == 'TRUE':
+    #     col1.markdown(f"ZPID: {zpid}; Fixer upper model classification: **:red[{model_clf}]**")#; Model probability {model_proba}")
+    # else:
+    #     col1.markdown(f"ZPID: {zpid}; Fixer upper model classification: **:blue[{model_clf}]**")
+    col1.markdown(f"ZPID: {zpid}; Address: {street_address}, {city}")
+
+    col1.markdown("### Label")
+    prop_cond_label = col1.radio(
+        "Property condition based on description label",
+        [":red[Distressed]", ":blue[Maintained]", ":green[Updated]", ":gray[Unknown]"],
+        captions = ["Fixer upper.", "Well maintained but not recently updated.", "Updated / Remodeled.", "Not enough information to draw a conclusion."])
+    sub_col1, sub_col2 = col1.columns(2)
+    label_button = sub_col1.button("Label", type="primary")
+    if label_button:
+        st.session_state['user_labeled_zpid'][user_name].append(zpid)
+        # write in gsheets
+        df_initial = st.session_state['dataset_initial']
+        idx = df_initial.index[df_initial['zpid'] == zpid].tolist()[0] + 2
+        if user_name == 'Ariel':
+            col_pos = 11
+        elif user_name == 'Liam':
+            col_pos = 12
+        elif user_name == 'Maddy':
+            col_pos = 13
+        row_lbl = prop_cond_label.split('[')[-1].replace(']','').lower()
+        st.session_state['sheet_name'].update_cell(idx,col_pos,row_lbl)
+        # feedback to user
+        sub_col1.write('Submitted')
+    next_button = sub_col2.button("Next")
+    if next_button:
+        df = df.loc[~df['zpid'].isin(user_labeled_zpids_in_session)]
+        # load dataset
+        # st.session_state['dataset_labeled'] = read_gshseets_dataset(file_name="ml_training_prop_cond_description_20231228")
 
 
-def get_days_on_zillow(latest_listings_dt, post_dt, x):
-    if post_dt == None:
-        post_dt = x['datePosted']
-    # check if date exists
-    if len(post_dt) >= 5:
-        retrieved_dt = datetime.strptime(latest_listings_dt, '%Y%m%d')
-        posted_dt = datetime.strptime(post_dt, '%Y-%m-%d')
-        return (retrieved_dt - posted_dt).days
-    # if not get days on zillow
-    else:
-        try:
-            return x['resoFacts']['daysOnZillow']
-        except:
-            try:
-                if 'hours' in x['timeOnZillow']:
-                    return 0
-                elif 'days' in x['timeOnZillow']:
-                    return int(x['timeOnZillow'].split(' ')[0])
-            except:
-                return None
+    col2.markdown("### Property Description")
 
+    # with col2.expander("See property attributes", expanded=True):
+    #     col2.write(df.head(1).reset_index(drop=True))
+    
+    # cleanse word and use keywords
+    annotate_word_list = []
 
-st.title('Agents 👩‍💼 with Active Listings 🏡')
+    distressed_keywords = [
+        'asis', 'as-is', 'cash', 'cosmetic',
+        'fix', 'flip', 'handyman', 'income', 'investor', 'investment',
+        'opportunity', 'potential', 'quick', 
+        'rehab', 'rent', 'repair', 'tenant', 'tlc', 'sell', 'unfinished'
+    ]
+                        
+    maintained_keywords = ['maintain']
 
-# read all active cities
-df_cities = read_df_from_s3('geographydata', "active_zip_city_state.csv")
-df_cities['location_name'] = df_cities.apply(lambda x: x['city'].lower() + ', ' + x['state'].lower(), axis=1)
-df_cities['parent_metro_region'] = df_cities.apply(lambda x: 
-    ' '.join(x.capitalize() for x in x['city'].split(' ')) + ', ' + x['state'], axis=1)
-
-city_option = st.selectbox(
-    'Select a city 👇',
-    df_cities['location_name'].tolist())
-
-if 'initial_run' not in st.session_state:
-    st.session_state['initial_run'] = False
-
-if st.button('Run') or st.session_state['initial_run'] == True:
-    st.session_state['initial_run'] = True
-    tab1, tab2 = st.tabs(["City Search", "Agent"])
-    with tab1:
-        # get latest listing
-        latest_listings_dt = get_latest_listings_dt()
-        # latest_listings_dt = '20230928'
-        year = latest_listings_dt[:4]
-        month = latest_listings_dt[4:6]
-        day = latest_listings_dt[-2:]
-
-        city_id = df_cities.loc[df_cities['location_name'] == city_option]['city_id'].iloc[0].split('_')[-1]
-        city = df_cities.loc[df_cities['location_name'] == city_option]['city'].iloc[0]
-        state = df_cities.loc[df_cities['location_name'] == city_option]['state'].iloc[0]
-        ###########################
-        #        READ PROPS       #
-        ###########################
-        data_prep_fn = f'data_preparation/{year}/{month}/{day}/{latest_listings_dt}_dataprep_{city_id}_{city}_{state}.json'
-        data_prep_json_raw = read_json_file(bucket='residentialpropertydata', key=data_prep_fn)
-        data_prep_json = json.loads(data_prep_json_raw)
-        st.session_state['dataprep'] = pd.DataFrame(data_prep_json) # TEMP
-        df_props = st.session_state['dataprep']
-        print(f'Starting run for {city}, {state} ({city_id}) for {len(df_props)} properties')
-
-        # get agent info
-        df_props['latest_listing_dt'] = df_props.apply(lambda x: latest_sale_listing_dt(x), axis=1)
-        df_props['days_on_zillow'] = df_props.apply(
-            lambda x: get_days_on_zillow(latest_listings_dt, x['latest_listing_dt'], x), axis=1)
-        df_props['agent_name'] = df_props.apply(lambda x: x['attributionInfo']['agentName'], axis=1)
-        df_props['agent_name_valid'] = df_props.apply(lambda x: False if (x['agent_name'] == None) else True, axis=1)
-        df_props['agent_email'] = df_props.apply(lambda x: x['attributionInfo']['agentEmail'], axis=1)
-        # phone number
-        df_props['agent_phone_number'] = df_props.apply(lambda x: x['attributionInfo']['agentPhoneNumber'], axis=1)
-        df_props['agent_phone_number_valid'] = df_props.apply(lambda x: False if (x['agent_phone_number'] == None) else True, axis=1)
-        # phone number - check exists
-        df_props = df_props.loc[df_props['agent_phone_number_valid'] == True]
-        # phone number - check if digit
-        df_props['agent_phone_number'] = df_props.apply(lambda x: x['agent_phone_number'].replace("-", ""), axis=1)
-        df_props['agent_phone_number_valid'] = df_props.apply(lambda x: False if (x['agent_phone_number'].isdigit() == False) else True, axis=1)
-        # profile url
-        df_props['agent_profile_url'] = df_props.apply(lambda x: x['listed_by']['profile_url'] if 'profile_url' in x['listed_by'] else None, axis=1)
-        # latest listing
-        df_props['listing_link'] = df_props.apply(lambda x: 
-            'https://www.coffeeclozers.com/properties/' + x['city_id'].split('_')[-1] + '/' + x['zpid_norm'], axis=1)
-
-        ###########################
-        #        READ PROPS       #
-        ###########################
-        df_filter = df_props.loc[
-            (df_props['agent_name_valid'] == True) & 
-            (df_props['agent_phone_number_valid'] == True) #&
-            # (df_props['days_on_zillow'] <= 90)
-        ]
-        df_filter['total_listings'] = df_filter.groupby('agent_phone_number')['zpid_norm'].transform('count')
-        df_filter['days_on_zillow_rank'] = df_filter.groupby("agent_phone_number")['days_on_zillow'].rank(method='first')
-        df_filter = df_filter.loc[df_filter['days_on_zillow_rank'] == 1]
-        df_filter['agent_first_name'] = df_filter.apply(lambda x: x['agent_name'].split(' ')[0], axis=1)
-        df_filter = df_filter[[
-                'agent_first_name', 'agent_name', 'agent_phone_number', 'agent_email', 'days_on_zillow', 'total_listings',
-                'streetAddress', 'city', 'state', 'city_id', 'zpid_norm', 'listing_link', 'agent_profile_url']].\
-            sort_values(by=['total_listings'], ascending=False).reset_index(drop=True)
+    updated_keywords = [
+        'adorable', 'beautiful', 'charm', 'clean', 'entertain', 'gorgeous', 'granite',
+        'hardwood', 'island', 'love', 'luxury', 'modern', 
+        'new', 'quartz', 'ready', 'redone', 'remarkable', 'remodel', 'reno', 'stainless',
+        'upgrade', 'update'
+    ]
         
-        st.write(df_filter)
+    for x in prop_dscr_raw.split(' '):
+        # cleansing
+        x = x.lower()
 
-        @st.cache_data
-        def convert_df(df):
-            return df.to_csv(index=False).encode('utf-8')
+        w = x + ' ' 
+        # distressed
+        for kw in distressed_keywords:
+            if (kw in w) and ('fixture' not in w) and ('different' not in w):
+                w = (w, "Distressed", "#faa")
+            # rm = ['fixture', 'different']
+            # if (kw in w):
+            #     for r in rm:
+            #         if r not in w:
+            #             w = (w, "Distressed", "#faa")
+        # maintained
+        for kw in maintained_keywords:
+            if kw in w:
+                w = (w, "Maintained", "#8ef")
+        # updated
+        for kw in updated_keywords:
+            if (kw in w):
+                w = (w, "Updated", "#afa")
 
-        csv = convert_df(df_filter)
+        annotate_word_list.append(w)
+    with col2:
+        annotated_text(annotate_word_list)
 
-        st.download_button(
-        "Press to Download",
-        csv,
-        "file.csv",
-        "text/csv",
-        key='download-csv'
-        )
 
-    with tab2:
-        st.write('Search agent phone number 📱 to get all listings')
-        agent_phone_number = st.text_input('Agent phone number')
 
-        if st.button('Search'):
-            cols_list = [
-                'streetAddress', 'postal_code', 'price', 'bedrooms', 'bathrooms', 
-                'derived_prop_type', 'days_on_zillow', 'listing_link']
-            df_props_by_phone = df_props.loc[df_props['agent_phone_number'] == agent_phone_number]
-            if len(df_props_by_phone) != 0:
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric(label="Number of Active Listings", value=len(df_props_by_phone))
-                col2.metric(label="Avg Days on Market", value=int(df_props_by_phone['days_on_zillow'].mean()))
-                col3.metric(label="Avg Price", value=int(df_props_by_phone['price'].mean()))
-                col4.metric(label="Ratio Fixer Uppers", value=str(round(
-                    len(df_props_by_phone.loc[df_props_by_phone['fixer_upper_flag'] == True]) / len(df_props_by_phone) *100, 2)) + '%')
-                st.write(df_props_by_phone[cols_list].reset_index(drop=True))
+
+##################################
+#             TAB 3              #
+##################################
+metrics_button = tab3.button("View Metrics")
+if (st.session_state['user_name'] in ['Ariel', 'Liam', 'Maddy']) and metrics_button:
+    # 1. check what is labeled and if issues
+    st.session_state['dataset_labeled'], st.session_state['sheet_name'] = read_gshseets_dataset(file_name=labeled_data_fn)
+    df = st.session_state['dataset_labeled']
+    tab3.markdown('## Summary of Data Labeled')
+    df_label_cat = df.groupby(['label_category'])['zpid'].count().reset_index().rename(columns={'zpid': 'count'})
+    label_cat_not_labeled = df_label_cat.loc[df_label_cat['label_category'] == 'not labeled']['count'].iloc[0]
+    _df_cat_confirmed = df_label_cat.loc[df_label_cat['label_category'] == 'confirmed label']
+    if len(_df_cat_confirmed) == 0:
+        label_cat_confirmed = 0
+    else:
+        label_cat_confirmed = _df_cat_confirmed['count'].iloc[0]
+    _df_cat_discrepancy = df_label_cat.loc[df_label_cat['label_category'] == 'discrepancy']
+    if len(_df_cat_discrepancy) == 0:
+        label_cat_discrepancy = 0
+    else:
+        label_cat_discrepancy = _df_cat_discrepancy['count'].iloc[0]
+    _df_cat_single_label = df_label_cat.loc[df_label_cat['label_category'] == 'single label']
+    if len(_df_cat_single_label) == 0:
+        label_cat_single_label = 0
+    else:
+        label_cat_single_label = _df_cat_single_label['count'].iloc[0]
+
+    tab3_col1, tab3_col2, tab3_col3, tab3_col4 = tab3.columns(4)
+    tab3_col1.metric("Valid Labels", label_cat_confirmed)
+    tab3_col2.metric("Single Labels", label_cat_single_label)
+    tab3_col3.metric("Discrepancy Labels", label_cat_discrepancy)
+    tab3_col4.metric("Not Labeled", label_cat_not_labeled)
+
+    # labels by user
+    tab3.markdown('## Breakdown')
+    tab3_col1, tab3_col2, tab3_col3 = tab3.columns(3)
+    tab3_col1.markdown('### Records Labeled by User')
+    total_labeled_by_user = {}
+    for c in ['ariel', 'liam', 'maddy']:
+        total_labeled_by_user[c] = len([x for x in df[c].tolist() if x != ''])
+    df_user_plot = pd.json_normalize(total_labeled_by_user).T.reset_index()\
+        .rename(columns={'index': 'user', 0: 'num_records_labeled'})
+    user_fig = px.bar(df_user_plot, x='user', y='num_records_labeled')
+    tab3_col1.plotly_chart(user_fig, use_container_width=True)
+
+    # categories labeled (pie)
+    tab3_col2.markdown('### Categories Labeled Prct')
+    df_sub_label = df.loc[df['label_category'] == 'confirmed label']\
+        .groupby(['final_label'])['zpid'].count().reset_index()\
+        .rename(columns={'zpid': 'count'})
+    sub_label_fig = px.pie(df_sub_label, values='count', names='final_label')
+    tab3_col2.plotly_chart(sub_label_fig, use_container_width=True)
+
+    # categories labeled (bar)
+    tab3_col3.markdown('### Categories Labeled Count')
+    user_fig = px.bar(df_sub_label, x='final_label', y='count')
+    tab3_col3.plotly_chart(user_fig, use_container_width=True)
